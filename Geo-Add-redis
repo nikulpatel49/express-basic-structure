@@ -1,0 +1,67 @@
+import Redis from "ioredis";
+import h3 from "h3-js";
+
+const redis = new Redis({ host: "127.0.0.1", port: 6379 });
+
+// Resolution determines cell size
+// res 8 ≈ 1km² cells, res 9 ≈ 0.5km²
+const H3_RESOLUTION = 8;
+
+/**
+ * Add driver location into hex shard
+ */
+export const addDriverLocation = async (
+  driverId: string,
+  longitude: number,
+  latitude: number
+) => {
+  const cell = h3.geoToH3(latitude, longitude, H3_RESOLUTION);
+  const key = `drivers:${cell}`;
+
+  // Add driver to cell set
+  await redis.geoadd(key, longitude, latitude, driverId);
+  await redis.set(`driver:lastseen:${driverId}`, Date.now(), "EX", 60);
+};
+
+/**
+ * Find nearby drivers using kRing expansion
+ */
+export const findNearbyDrivers = async (
+  longitude: number,
+  latitude: number,
+  count: number = 10
+) => {
+  const originCell = h3.geoToH3(latitude, longitude, H3_RESOLUTION);
+
+  // Expand outward (kRing search)
+  for (let k = 0; k <= 5; k++) {
+    const cells = h3.kRing(originCell, k); // neighbors
+    const pipeline = redis.pipeline();
+
+    cells.forEach((cell) => {
+      pipeline.geosearch(
+        `drivers:${cell}`,
+        "FROMLONLAT",
+        longitude,
+        latitude,
+        "BYRADIUS",
+        5, // 5km per shard search
+        "km",
+        "ASC",
+        "COUNT",
+        count,
+        "WITHDIST",
+        "WITHCOORD"
+      );
+    });
+
+    const results = await pipeline.exec();
+    const drivers = results.flatMap(([, val]) => val || []);
+
+    if (drivers.length > 0) {
+      return drivers.slice(0, count);
+    }
+  }
+
+  return [];
+};
