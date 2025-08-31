@@ -1,20 +1,21 @@
 /**
  * ===================================================
- *  Ride Booking System - Full Flow (Single File)
+ *  Ride Booking System - Full Flow (Single File, TS)
  * ===================================================
  * Includes:
- *   ✅ Constants (Ride, Driver, Passenger, Payment, Trip)
+ *   ✅ Constants & Types
  *   ✅ Redis Setup
  *   ✅ Kafka Setup
  *   ✅ Lua Script (Atomic Driver Assignment)
  *   ✅ Ride Service (5 Steps: Create → Category → Accept → Cancel → Complete & Pay)
- *   ✅ Sequence Diagram (Mermaid.js)
  * ===================================================
  */
 
+import Redis from "ioredis";
+import { Kafka, Producer } from "kafkajs";
 
 // ===============================
-// 📌 Constants
+// 📌 Constants & Types
 // ===============================
 export const RIDE_STATUS = {
   REQUESTED: "rq",
@@ -22,14 +23,6 @@ export const RIDE_STATUS = {
   STARTED: "st",
   COMPLETED: "cp",
   CANCELLED: "cl",
-} as const;
-
-export const RIDE_STATUS_LABELS = {
-  rq: "Requested",
-  as: "Assigned",
-  st: "Started",
-  cp: "Completed",
-  cl: "Cancelled",
 } as const;
 
 export type RideStatus = (typeof RIDE_STATUS)[keyof typeof RIDE_STATUS];
@@ -41,12 +34,7 @@ export const DRIVER_STATUS = {
   SUSPENDED: "sp",
 } as const;
 
-export const DRIVER_STATUS_LABELS = {
-  av: "Available",
-  by: "Busy",
-  of: "Offline",
-  sp: "Suspended",
-} as const;
+export type DriverStatus = (typeof DRIVER_STATUS)[keyof typeof DRIVER_STATUS];
 
 export const PASSENGER_STATUS = {
   ACTIVE: "ac",
@@ -54,11 +42,7 @@ export const PASSENGER_STATUS = {
   DELETED: "dl",
 } as const;
 
-export const PASSENGER_STATUS_LABELS = {
-  ac: "Active",
-  bl: "Blocked",
-  dl: "Deleted",
-} as const;
+export type PassengerStatus = (typeof PASSENGER_STATUS)[keyof typeof PASSENGER_STATUS];
 
 export const PAYMENT_STATUS = {
   PENDING: "pn",
@@ -67,12 +51,7 @@ export const PAYMENT_STATUS = {
   REFUNDED: "rf",
 } as const;
 
-export const PAYMENT_STATUS_LABELS = {
-  pn: "Pending",
-  sc: "Success",
-  fl: "Failed",
-  rf: "Refunded",
-} as const;
+export type PaymentStatus = (typeof PAYMENT_STATUS)[keyof typeof PAYMENT_STATUS];
 
 export const TRIP_CATEGORY = {
   ONE_WAY: "ow",
@@ -80,49 +59,68 @@ export const TRIP_CATEGORY = {
   HOURLY: "hr",
 } as const;
 
-export const TRIP_CATEGORY_LABELS = {
-  ow: "One Way",
-  rt: "Return",
-  hr: "Hourly",
-} as const;
+export type TripCategory = (typeof TRIP_CATEGORY)[keyof typeof TRIP_CATEGORY];
 
+// ===============================
+// 📌 Interfaces
+// ===============================
+export interface Ride {
+  id: string;
+  passengerId: string;
+  pickup: string;
+  drop: string;
+  category: TripCategory | null;
+  status: RideStatus;
+  driverId?: string;
+  createdAt: number;
+  completedAt?: number;
+  cancelledBy?: "passenger" | "driver";
+}
+
+export interface Driver {
+  id: string;
+  status: DriverStatus;
+}
+
+export interface Payment {
+  id: string;
+  rideId: string;
+  passengerId: string;
+  amount: number;
+  status: PaymentStatus;
+  createdAt: number;
+}
 
 // ===============================
 // 📌 Redis Setup
 // ===============================
-import Redis from "ioredis";
-
 export const redis = new Redis({
   host: "localhost",
   port: 6379,
 });
 
-
 // ===============================
 // 📌 Kafka Setup
 // ===============================
-import { Kafka } from "kafkajs";
-
 const kafka = new Kafka({
   clientId: "ride-service",
   brokers: ["localhost:9092"],
 });
 
-export const kafkaProducer = kafka.producer();
+export let kafkaProducer: Producer;
 
-export async function connectKafka() {
+export async function connectKafka(): Promise<void> {
+  kafkaProducer = kafka.producer();
   await kafkaProducer.connect();
-  console.log("Kafka connected 🚀");
+  console.log("✅ Kafka connected");
 }
-
 
 // ===============================
 // 📌 Redis Keys Helpers
 // ===============================
-const rideKey = (rideId: string) => `ride:${rideId}`;
-const driverKey = (driverId: string) => `driver:${driverId}`;
-const paymentKey = (paymentId: string) => `payment:${paymentId}`;
-
+const rideKey = (rideId: string): string => `ride:${rideId}`;
+const driverKey = (driverId: string): string => `driver:${driverId}`;
+const paymentKey = (paymentId: string): string => `payment:${paymentId}`;
 
 // ===============================
 // 📌 Lua Script (Driver Accept - Atomic)
@@ -146,15 +144,18 @@ const acceptRideScript = `
   return "OK"
 `;
 
-
 // ===============================
 // 📌 Ride Service
 // ===============================
 
 // STEP 1: Create Ride Request
-export async function createRideRequest(passengerId: string, pickup: string, drop: string) {
+export async function createRideRequest(
+  passengerId: string,
+  pickup: string,
+  drop: string
+): Promise<Ride> {
   const rideId = `ride-${Date.now()}`;
-  const ride = {
+  const ride: Ride = {
     id: rideId,
     passengerId,
     pickup,
@@ -164,7 +165,7 @@ export async function createRideRequest(passengerId: string, pickup: string, dro
     createdAt: Date.now(),
   };
 
-  await redis.hmset(rideKey(rideId), ride);
+  await redis.hmset(rideKey(rideId), ride as any);
 
   await kafkaProducer.send({
     topic: "ride_created",
@@ -174,11 +175,12 @@ export async function createRideRequest(passengerId: string, pickup: string, dro
   return ride;
 }
 
-
 // STEP 2: Passenger Selects Category
-export async function updateRideCategory(rideId: string, category: keyof typeof TRIP_CATEGORY) {
+export async function updateRideCategory(
+  rideId: string,
+  category: keyof typeof TRIP_CATEGORY
+): Promise<{ rideId: string; category: TripCategory }> {
   const categoryCode = TRIP_CATEGORY[category];
-
   await redis.hset(rideKey(rideId), "category", categoryCode);
 
   await kafkaProducer.send({
@@ -189,9 +191,11 @@ export async function updateRideCategory(rideId: string, category: keyof typeof 
   return { rideId, category: categoryCode };
 }
 
-
-// STEP 3: Driver Accepts Ride (Atomic)
-export async function assignDriver(rideId: string, driverId: string) {
+// STEP 3: Driver Accepts Ride (Atomic with Lua)
+export async function assignDriver(
+  rideId: string,
+  driverId: string
+): Promise<{ rideId: string; driverId: string; status: RideStatus }> {
   const result = await redis.eval(
     acceptRideScript,
     2,
@@ -214,9 +218,11 @@ export async function assignDriver(rideId: string, driverId: string) {
   return { rideId, driverId, status: RIDE_STATUS.ASSIGNED };
 }
 
-
 // STEP 4: Ride Cancellation
-export async function cancelRide(rideId: string, cancelledBy: "passenger" | "driver") {
+export async function cancelRide(
+  rideId: string,
+  cancelledBy: "passenger" | "driver"
+): Promise<{ rideId: string; status: RideStatus; cancelledBy: string }> {
   await redis.hset(rideKey(rideId), "status", RIDE_STATUS.CANCELLED, "cancelledBy", cancelledBy);
 
   await kafkaProducer.send({
@@ -227,9 +233,12 @@ export async function cancelRide(rideId: string, cancelledBy: "passenger" | "dri
   return { rideId, status: RIDE_STATUS.CANCELLED, cancelledBy };
 }
 
-
 // STEP 5: Ride Completion & Payment Processing
-export async function completeRideAndProcessPayment(rideId: string, driverId: string, amount: number) {
+export async function completeRideAndProcessPayment(
+  rideId: string,
+  driverId: string,
+  amount: number
+): Promise<{ rideId: string; driverId: string; status: RideStatus; payment: Payment }> {
   // Mark ride as completed
   await redis.hset(rideKey(rideId), "status", RIDE_STATUS.COMPLETED, "completedAt", Date.now());
 
@@ -238,16 +247,18 @@ export async function completeRideAndProcessPayment(rideId: string, driverId: st
 
   // Create payment
   const paymentId = `payment-${Date.now()}`;
-  const payment = {
+  const passengerId = (await redis.hget(rideKey(rideId), "passengerId")) || "unknown";
+
+  const payment: Payment = {
     id: paymentId,
     rideId,
-    passengerId: await redis.hget(rideKey(rideId), "passengerId"),
+    passengerId,
     amount,
     status: PAYMENT_STATUS.PENDING,
     createdAt: Date.now(),
   };
 
-  await redis.hmset(paymentKey(paymentId), payment);
+  await redis.hmset(paymentKey(paymentId), payment as any);
 
   // Simulate Payment Success
   await redis.hset(paymentKey(paymentId), "status", PAYMENT_STATUS.SUCCESS);
