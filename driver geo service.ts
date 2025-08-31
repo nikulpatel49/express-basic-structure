@@ -36,6 +36,212 @@ export async function updateLocation(driverId: string, lat: number, lon: number)
   return { driverId, cell };
 }
 
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+  import Redis from "ioredis";
+import * as h3 from "h3-js";
+
+// ---------------- Config ----------------
+const H3_RES = Number(process.env.H3_RES || 8);
+const LAST_SEEN_TTL_MS = Number(process.env.LAST_SEEN_TTL_MS || 30_000); // 30s TTL
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+
+const redis = new Redis(REDIS_URL);
+
+// ---------------- Key helpers ----------------
+const geoKeyForCell = (cell: string) => `geo:drivers:h3:${H3_RES}:${cell}`;
+const driverMetaKey = (driverId: string) => `driver:meta:${driverId}`;
+
+// ---------------- Public API ----------------
+/**
+ * Update a driver's location.
+ * - Stores geo position in geo:H3 cell (GEOADD)
+ * - Updates driver:meta:{driverId} hash with { cell, lastSeen }
+ * - Sets PEXPIRE on driver meta
+ */
+export async function updateLocation(driverId: string, lat: number, lon: number) {
+  const cell = h3.latLngToCell(lat, lon, H3_RES);
+  const geoKey = geoKeyForCell(cell);
+
+  // read previous cell from hash
+  const prevCell = await redis.hget(driverMetaKey(driverId), "cell");
+
+  const pipeline = redis.pipeline();
+
+  // Remove from previous cell (if moved)
+  if (prevCell && prevCell !== cell) {
+    const prevGeoKey = geoKeyForCell(prevCell);
+    // use ZREM since GEOADD stores members in a sorted-set structure
+    pipeline.zrem(prevGeoKey, driverId);
+  }
+
+  // Add to new cell
+  pipeline.geoadd(geoKey, lon, lat, driverId);
+
+  // Expire geo set if not touched (prevents zombie cells)
+  pipeline.expire(geoKey, Math.ceil(LAST_SEEN_TTL_MS / 1000) + 5);
+
+  // Store meta in a single hash and expire it
+  pipeline.hset(driverMetaKey(driverId), {
+    cell,
+    lastSeen: Date.now().toString(),
+  });
+  pipeline.pexpire(driverMetaKey(driverId), LAST_SEEN_TTL_MS);
+
+  await pipeline.exec();
+
+  return { driverId, cell, moved: prevCell !== cell };
+}
+
+/**
+ * Get full meta for a driver: { cell, lastSeen }
+ */
+export async function getDriverMeta(driverId: string) {
+  const data = await redis.hgetall(driverMetaKey(driverId));
+  if (!data || !data.cell) return null;
+  return {
+    cell: data.cell,
+    lastSeen: data.lastSeen ? Number(data.lastSeen) : null,
+  };
+}
+
+/** Get only the driver's cell */
+export async function getDriverCell(driverId: string) {
+  return await redis.hget(driverMetaKey(driverId), "cell");
+}
+
+/** Get only the driver's lastSeen timestamp (ms) */
+export async function getDriverLastSeen(driverId: string) {
+  const ts = await redis.hget(driverMetaKey(driverId), "lastSeen");
+  return ts ? Number(ts) : null;
+}
+
+/** True if driver was active within LAST_SEEN_TTL_MS */
+export async function isDriverActive(driverId: string): Promise<boolean> {
+  const lastSeen = await getDriverLastSeen(driverId);
+  if (!lastSeen) return false;
+  return Date.now() - lastSeen <= LAST_SEEN_TTL_MS;
+}
+
+// ---------------- SCAN utility ----------------
+async function* scanKeys(pattern: string, count = 100) {
+  let cursor = "0";
+  do {
+    const [nextCursor, keys] = (await redis.scan(cursor, "MATCH", pattern, "COUNT", count)) as [
+      string,
+      string[]
+    ];
+    cursor = nextCursor;
+    for (const key of keys) yield key;
+  } while (cursor !== "0");
+}
+
+// ---------------- Cleanup ----------------
+/**
+ * Remove inactive drivers from a single geo cell.
+ * Inactive criteria: missing meta OR lastSeen older than TTL.
+ */
+export async function cleanupGeoCell(cell: string) {
+  const geoKey = geoKeyForCell(cell);
+
+  // Get all drivers in this cell
+  const drivers = await redis.zrange(geoKey, 0, -1);
+  if (drivers.length === 0) return 0;
+
+  const pipeline = redis.pipeline();
+  for (const driverId of drivers) {
+    pipeline.hget(driverMetaKey(driverId), "lastSeen");
+  }
+  const results = await pipeline.exec();
+
+  const now = Date.now();
+  const inactiveDrivers: string[] = [];
+
+  drivers.forEach((driverId, i) => {
+    const res = results[i];
+    // results[i] is [err, value]
+    const lastSeenStr = res ? res[1] : null;
+    const lastSeen = lastSeenStr ? Number(lastSeenStr) : 0;
+
+    if (!lastSeen || now - lastSeen > LAST_SEEN_TTL_MS) {
+      inactiveDrivers.push(driverId);
+    }
+  });
+
+  if (inactiveDrivers.length > 0) {
+    await redis.zrem(geoKey, ...inactiveDrivers);
+  }
+
+  return inactiveDrivers.length;
+}
+
+/**
+ * Iterate over all geo cells using SCAN and clean each cell.
+ * batchSize controls SCAN COUNT.
+ */
+export async function cleanupAllGeoCells(batchSize = 100) {
+  let removed = 0;
+  for await (const key of scanKeys(`geo:drivers:h3:${H3_RES}:*`, batchSize)) {
+    const cell = key.split(":").pop()!;
+    try {
+      removed += await cleanupGeoCell(cell);
+    } catch (err) {
+      // log and continue
+      // eslint-disable-next-line no-console
+      console.error(`cleanupGeoCell failed for ${cell}:`, err);
+    }
+  }
+  return removed;
+}
+
+// ---------------- Convenience runner (optional) ----------------
+/**
+ * Start a background cleaner loop. Call this when booting a worker process.
+ * Returns a function to stop the interval.
+ */
+export function startCleaner(options?: { intervalMs?: number; batchSize?: number }) {
+  const intervalMs = options?.intervalMs ?? 10_000; // default 10s
+  const batchSize = options?.batchSize ?? 200;
+
+  let running = true;
+  const handle = setInterval(async () => {
+    if (!running) return;
+    try {
+      const removed = await cleanupAllGeoCells(batchSize);
+      if (removed > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`🧹 Cleaned ${removed} zombie drivers`);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("Cleaner loop error:", err);
+    }
+  }, intervalMs);
+
+  return () => {
+    running = false;
+    clearInterval(handle);
+  };
+}
+
+// ---------------- Export default for convenience ----------------
+export default {
+  updateLocation,
+  getDriverMeta,
+  getDriverCell,
+  getDriverLastSeen,
+  isDriverActive,
+  cleanupGeoCell,
+  cleanupAllGeoCells,
+  startCleaner,
+};
+
+
+
+  ---------------------------------------------------------------------------------------------------------------------------------------------------
+
 // ---------------- Search Nearby ----------------
 export async function searchNearby(lat: number, lon: number, radiusMeters: number, maxResults = 50) {
   const centerCell = h3.latLngToCell(lat, lon, H3_RES);
