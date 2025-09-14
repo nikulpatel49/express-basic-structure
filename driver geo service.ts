@@ -1,454 +1,196 @@
-// driver_geo_service.ts
-/**
- * Driver GEO service (no Lua, clean design)
- * ----------------------------------------------------
- * ✅ Update location every 5s
- * ✅ H3 sharding: 1 GEO key per H3 cell
- * ✅ Nearby search: H3 gridDisk + pipelined GEOSEARCH
- * ❌ No expiry subscriber (cleanup handled externally)
- */
-
-import Redis from "ioredis";
-import * as h3 from "h3-js";
-
-// ---------------- Config ----------------
-const H3_RES = Number(process.env.H3_RES || 8);
-const LAST_SEEN_TTL_MS = Number(process.env.LAST_SEEN_TTL_MS || 30_000); // 30s TTL
-
-const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
-
-// ---------------- Helpers ----------------
-const geoKeyForCell = (cell: string) => `geo:drivers:h3:${H3_RES}:${cell}`;
-const driverLastSeenKey = (driverId: string) => `driver:lastSeen:${driverId}`;
-const driverCellKey = (driverId: string) => `driver:cell:${driverId}`;
-
-// ---------------- Update Location ----------------
-export async function updateLocation(driverId: string, lat: number, lon: number) {
-  const cell = h3.latLngToCell(lat, lon, H3_RES);
-  const geoKey = geoKeyForCell(cell);
-
-  const pipeline = redis.pipeline();
-  pipeline.geoadd(geoKey, lon, lat, driverId);
-  pipeline.set(driverCellKey(driverId), cell);
-  pipeline.set(driverLastSeenKey(driverId), Date.now().toString(), "PX", LAST_SEEN_TTL_MS);
-  await pipeline.exec();
-
-  return { driverId, cell };
-}
-
-
------------------------------------------------------------------------------------------------------------------------------------------------------
-
-
-  import Redis from "ioredis";
-import * as h3 from "h3-js";
-
-// ---------------- Config ----------------
-const H3_RES = Number(process.env.H3_RES || 8);
-const LAST_SEEN_TTL_MS = Number(process.env.LAST_SEEN_TTL_MS || 30_000); // 30s TTL
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-
-const redis = new Redis(REDIS_URL);
-
-// ---------------- Key helpers ----------------
-const geoKeyForCell = (cell: string) => `geo:drivers:h3:${H3_RES}:${cell}`;
-const driverMetaKey = (driverId: string) => `driver:meta:${driverId}`;
-
-// ---------------- Public API ----------------
-/**
- * Update a driver's location.
- * - Stores geo position in geo:H3 cell (GEOADD)
- * - Updates driver:meta:{driverId} hash with { cell, lastSeen }
- * - Sets PEXPIRE on driver meta
- */
-export async function updateLocation(driverId: string, lat: number, lon: number) {
-  const cell = h3.latLngToCell(lat, lon, H3_RES);
-  const geoKey = geoKeyForCell(cell);
-
-  // read previous cell from hash
-  const prevCell = await redis.hget(driverMetaKey(driverId), "cell");
-
-  const pipeline = redis.pipeline();
-
-  // Remove from previous cell (if moved)
-  if (prevCell && prevCell !== cell) {
-    const prevGeoKey = geoKeyForCell(prevCell);
-    // use ZREM since GEOADD stores members in a sorted-set structure
-    pipeline.zrem(prevGeoKey, driverId);
-  }
-
-  // Add to new cell
-  pipeline.geoadd(geoKey, lon, lat, driverId);
-
-  // Expire geo set if not touched (prevents zombie cells)
-  pipeline.expire(geoKey, Math.ceil(LAST_SEEN_TTL_MS / 1000) + 5);
-
-  // Store meta in a single hash and expire it
-  pipeline.hset(driverMetaKey(driverId), {
-    cell,
-    lastSeen: Date.now().toString(),
-  });
-  pipeline.pexpire(driverMetaKey(driverId), LAST_SEEN_TTL_MS);
-
-  await pipeline.exec();
-
-  return { driverId, cell, moved: prevCell !== cell };
-}
-
-/**
- * Get full meta for a driver: { cell, lastSeen }
- */
-export async function getDriverMeta(driverId: string) {
-  const data = await redis.hgetall(driverMetaKey(driverId));
-  if (!data || !data.cell) return null;
-  return {
-    cell: data.cell,
-    lastSeen: data.lastSeen ? Number(data.lastSeen) : null,
-  };
-}
-
-/** Get only the driver's cell */
-export async function getDriverCell(driverId: string) {
-  return await redis.hget(driverMetaKey(driverId), "cell");
-}
-
-/** Get only the driver's lastSeen timestamp (ms) */
-export async function getDriverLastSeen(driverId: string) {
-  const ts = await redis.hget(driverMetaKey(driverId), "lastSeen");
-  return ts ? Number(ts) : null;
-}
-
-/** True if driver was active within LAST_SEEN_TTL_MS */
-export async function isDriverActive(driverId: string): Promise<boolean> {
-  const lastSeen = await getDriverLastSeen(driverId);
-  if (!lastSeen) return false;
-  return Date.now() - lastSeen <= LAST_SEEN_TTL_MS;
-}
-
-// ---------------- SCAN utility ----------------
-async function* scanKeys(pattern: string, count = 100) {
-  let cursor = "0";
-  do {
-    const [nextCursor, keys] = (await redis.scan(cursor, "MATCH", pattern, "COUNT", count)) as [
-      string,
-      string[]
-    ];
-    cursor = nextCursor;
-    for (const key of keys) yield key;
-  } while (cursor !== "0");
-}
-
-// ---------------- Cleanup ----------------
-/**
- * Remove inactive drivers from a single geo cell.
- * Inactive criteria: missing meta OR lastSeen older than TTL.
- */
-export async function cleanupGeoCell(cell: string) {
-  const geoKey = geoKeyForCell(cell);
-
-  // Get all drivers in this cell
-  const drivers = await redis.zrange(geoKey, 0, -1);
-  if (drivers.length === 0) return 0;
-
-  const pipeline = redis.pipeline();
-  for (const driverId of drivers) {
-    pipeline.hget(driverMetaKey(driverId), "lastSeen");
-  }
-  const results = await pipeline.exec();
-
-  const now = Date.now();
-  const inactiveDrivers: string[] = [];
-
-  drivers.forEach((driverId, i) => {
-    const res = results[i];
-    // results[i] is [err, value]
-    const lastSeenStr = res ? res[1] : null;
-    const lastSeen = lastSeenStr ? Number(lastSeenStr) : 0;
-
-    if (!lastSeen || now - lastSeen > LAST_SEEN_TTL_MS) {
-      inactiveDrivers.push(driverId);
-    }
-  });
-
-  if (inactiveDrivers.length > 0) {
-    await redis.zrem(geoKey, ...inactiveDrivers);
-  }
-
-  return inactiveDrivers.length;
-}
-
-/**
- * Iterate over all geo cells using SCAN and clean each cell.
- * batchSize controls SCAN COUNT.
- */
-export async function cleanupAllGeoCells(batchSize = 100) {
-  let removed = 0;
-  for await (const key of scanKeys(`geo:drivers:h3:${H3_RES}:*`, batchSize)) {
-    const cell = key.split(":").pop()!;
-    try {
-      removed += await cleanupGeoCell(cell);
-    } catch (err) {
-      // log and continue
-      // eslint-disable-next-line no-console
-      console.error(`cleanupGeoCell failed for ${cell}:`, err);
-    }
-  }
-  return removed;
-}
-
-// ---------------- Convenience runner (optional) ----------------
-/**
- * Start a background cleaner loop. Call this when booting a worker process.
- * Returns a function to stop the interval.
- */
-export function startCleaner(options?: { intervalMs?: number; batchSize?: number }) {
-  const intervalMs = options?.intervalMs ?? 10_000; // default 10s
-  const batchSize = options?.batchSize ?? 200;
-
-  let running = true;
-  const handle = setInterval(async () => {
-    if (!running) return;
-    try {
-      const removed = await cleanupAllGeoCells(batchSize);
-      if (removed > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`🧹 Cleaned ${removed} zombie drivers`);
-      }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("Cleaner loop error:", err);
-    }
-  }, intervalMs);
-
-  return () => {
-    running = false;
-    clearInterval(handle);
-  };
-}
-
-// ---------------- Export default for convenience ----------------
-export default {
-  updateLocation,
-  getDriverMeta,
-  getDriverCell,
-  getDriverLastSeen,
-  isDriverActive,
-  cleanupGeoCell,
-  cleanupAllGeoCells,
-  startCleaner,
-};
-
-
-
-  ---------------------------------------------------------------------------------------------------------------------------------------------------
-
-// ---------------- Search Nearby ----------------
-export async function searchNearby(lat: number, lon: number, radiusMeters: number, maxResults = 50) {
-  const centerCell = h3.latLngToCell(lat, lon, H3_RES);
-
-  const edgeLengthMeters = h3.edgeLength(H3_RES, h3.UNITS.m);
-  const rings = Math.ceil(radiusMeters / edgeLengthMeters);
-  const cells = h3.gridDisk(centerCell, rings);
-
-  const pipeline = redis.pipeline();
-  for (const cell of cells) {
-    const geoKey = geoKeyForCell(cell);
-    pipeline.send_command("GEOSEARCH", [
-      geoKey,
-      "FROMLONLAT",
-      String(lon),
-      String(lat),
-      "BYRADIUS",
-      String(radiusMeters),
-      "m",
-      "WITHDIST",
-      "WITHCOORD",
-      "ASC",
-      "COUNT",
-      String(maxResults),
-    ]);
-  }
-
-  const rawResults = await pipeline.exec();
-
-  const results = rawResults
-    .filter(([err]) => !err)
-    .flatMap(([_, value]) => value as [string, string, [string, string]][]);
-
-  const merged = results
-    .map(([id, dist, [lng, lat]]) => ({
-      driverId: id,
-      distance: parseFloat(dist),
-      location: { lat: parseFloat(lat), lon: parseFloat(lng) },
-    }))
-    .sort((a, b) => a.distance - b.distance);
-
-  const seen = new Set<string>();
-  const unique = merged.filter((r) => {
-    if (seen.has(r.driverId)) return false;
-    seen.add(r.driverId);
-    return true;
-  });
-
-  return unique.slice(0, maxResults);
-}
-
-// ---------------- Demo Run ----------------
-if (require.main === module) {
-  (async () => {
-    await updateLocation("driver:demo1", 19.0760, 72.8777); // Mumbai
-    await updateLocation("driver:demo2", 19.0896, 72.8656); // Mumbai nearby
-
-    console.log("✅ Inserted demo drivers");
-
-    const nearby = await searchNearby(19.0760, 72.8777, 3000, 10);
-    console.log("🔍 Nearby drivers:", nearby);
-  })();
-}
-
-
-
-============================================================================================
-
-
-// driver_geo_service.ts
 import Redis from "ioredis";
 import * as h3 from "h3-js";
 import cron from "node-cron";
 
 // ---------------- Config ----------------
 const H3_RES = Number(process.env.H3_RES || 8);
-const LAST_SEEN_TTL_MS = Number(process.env.LAST_SEEN_TTL_MS || 30_000); // 30s TTL
+const LAST_SEEN_TTL_MS = Number(process.env.LAST_SEEN_TTL_MS || 30_000);
 const CLEANUP_BATCH_SIZE = 1000;
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 
-const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
-
+const redis = new Redis(REDIS_URL);
 const ACTIVE_DRIVERS_SET = "drivers:active";
 
-// ---------------- Helpers ----------------
-const geoKeyForCell = (cell: string) => `geo:drivers:h3:${H3_RES}:${cell}`;
-const driverLastSeenKey = (driverId: string) => `driver:lastSeen:${driverId}`;
-const driverCellKey = (driverId: string) => `driver:cell:${driverId}`;
+// ---------------- Categories ----------------
+const CATEGORIES = ["bike", "car", "suv", "truck", "van"] as const;
+type Category = typeof CATEGORIES[number];
+
+// ---------------- Redis Key Helpers ----------------
+const geoKeyForCell = (category: string, cell: string) =>
+  `geo:drivers:${category}:h3:${H3_RES}:${cell}`;
+const driverMetaKey = (driverId: string) => `driver:meta:${driverId}`;
 
 // ---------------- Update Location ----------------
-export async function updateLocation(driverId: string, lat: number, lon: number) {
+export async function updateLocation(
+  driverId: string,
+  lat: number,
+  lon: number,
+  category: Category
+) {
   const cell = h3.latLngToCell(lat, lon, H3_RES);
-  const geoKey = geoKeyForCell(cell);
+  const geoKey = geoKeyForCell(category, cell);
 
   const pipeline = redis.pipeline();
+
   pipeline.geoadd(geoKey, lon, lat, driverId);
-  pipeline.set(driverCellKey(driverId), cell);
-  pipeline.set(driverLastSeenKey(driverId), Date.now().toString(), "PX", LAST_SEEN_TTL_MS);
-  pipeline.sadd(ACTIVE_DRIVERS_SET, driverId); // track active drivers
+  pipeline.expire(geoKey, Math.ceil(LAST_SEEN_TTL_MS / 1000) + 5);
+
+  pipeline.hset(driverMetaKey(driverId), {
+    cell,
+    category,
+    lastSeen: Date.now().toString(),
+  });
+  pipeline.pexpire(driverMetaKey(driverId), LAST_SEEN_TTL_MS);
+
+  pipeline.sadd(ACTIVE_DRIVERS_SET, driverId);
+
   await pipeline.exec();
 
-  return { driverId, cell };
+  return { driverId, cell, category };
 }
 
 // ---------------- Search Nearby ----------------
-export async function searchNearby(lat: number, lon: number, radiusMeters: number, maxResults = 50) {
+export async function searchNearby(
+  lat: number,
+  lon: number,
+  radiusMeters: number,
+  maxPerCategory = 1
+) {
   const centerCell = h3.latLngToCell(lat, lon, H3_RES);
   const edgeLengthMeters = h3.edgeLength(H3_RES, h3.UNITS.m);
   const rings = Math.ceil(radiusMeters / edgeLengthMeters);
   const cells = h3.gridDisk(centerCell, rings);
 
   const pipeline = redis.pipeline();
-  for (const cell of cells) {
-    const geoKey = geoKeyForCell(cell);
-    pipeline.send_command("GEOSEARCH", [
-      geoKey,
-      "FROMLONLAT",
-      String(lon),
-      String(lat),
-      "BYRADIUS",
-      String(radiusMeters),
-      "m",
-      "WITHDIST",
-      "WITHCOORD",
-      "ASC",
-      "COUNT",
-      String(maxResults),
-    ]);
+
+  for (const category of CATEGORIES) {
+    for (const cell of cells) {
+      const geoKey = geoKeyForCell(category, cell);
+      pipeline.send_command("GEOSEARCH", [
+        geoKey,
+        "FROMLONLAT",
+        String(lon),
+        String(lat),
+        "BYRADIUS",
+        String(radiusMeters),
+        "m",
+        "WITHDIST",
+        "WITHCOORD",
+        "ASC",
+        "COUNT",
+        String(maxPerCategory),
+      ]);
+    }
   }
 
   const rawResults = await pipeline.exec();
 
-  const results = rawResults
-    .filter(([err]) => !err)
-    .flatMap(([_, value]) => value as [string, string, [string, string]][]);
+  const categoryResults: Record<string, any[]> = {};
+  let idx = 0;
 
-  const merged = results
-    .map(([id, dist, [lng, lat]]) => ({
-      driverId: id,
-      distance: parseFloat(dist),
-      location: { lat: parseFloat(lat), lon: parseFloat(lng) },
-    }))
-    .sort((a, b) => a.distance - b.distance);
+  for (const category of CATEGORIES) {
+    categoryResults[category] = [];
+    for (let i = 0; i < cells.length; i++) {
+      const [err, res] = rawResults[idx++] || [];
+      if (err || !res) continue;
 
-  const seen = new Set<string>();
-  const unique = merged.filter((r) => {
-    if (seen.has(r.driverId)) return false;
-    seen.add(r.driverId);
-    return true;
-  });
+      for (const [id, distStr, [lonStr, latStr]] of res as [string, string, [string, string]][]) {
+        categoryResults[category].push({
+          driverId: id,
+          distance: parseFloat(distStr),
+          location: { lat: parseFloat(latStr), lon: parseFloat(lonStr) },
+        });
+      }
+    }
+  }
 
-  return unique.slice(0, maxResults);
+  const finalResults = [];
+
+  for (const category of CATEGORIES) {
+    const sorted = categoryResults[category].sort((a, b) => a.distance - b.distance);
+    const seen = new Set<string>();
+
+    for (const driver of sorted) {
+      if (!seen.has(driver.driverId)) {
+        finalResults.push({ ...driver, category });
+        seen.add(driver.driverId);
+        break;
+      }
+    }
+  }
+
+  return finalResults;
 }
 
-// ---------------- Cleanup Job ----------------
-async function cleanupInactiveDrivers() {
+// ---------------- Cleanup Inactive Drivers ----------------
+export async function cleanupInactiveDrivers() {
   let cursor = "0";
-  let processed = 0;
   let removed = 0;
 
   do {
-    const [newCursor, driverIds] = await redis.sscan(ACTIVE_DRIVERS_SET, cursor, "COUNT", CLEANUP_BATCH_SIZE);
-    cursor = newCursor;
-
-    if (driverIds.length === 0) continue;
+    const [nextCursor, driverIds] = await redis.sscan(ACTIVE_DRIVERS_SET, cursor, "COUNT", CLEANUP_BATCH_SIZE);
+    cursor = nextCursor;
 
     const pipeline = redis.pipeline();
-    driverIds.forEach((id) => pipeline.exists(driverLastSeenKey(id)));
-    const checks = await pipeline.exec();
+    driverIds.forEach((id) => pipeline.hgetall(driverMetaKey(id)));
+    const results = await pipeline.exec();
 
-    for (let i = 0; i < driverIds.length; i++) {
+    for (let i = 0; i < results.length; i++) {
+      const [err, meta] = results[i];
       const driverId = driverIds[i];
-      const [err, exists] = checks[i];
-      if (err) continue;
-
-      if (exists === 0) {
-        // expired driver
-        const cell = await redis.get(driverCellKey(driverId));
-        if (cell) {
-          const geoKey = geoKeyForCell(cell);
-          await redis.zrem(geoKey, driverId);
-          await redis.del(driverCellKey(driverId));
-        }
+      if (err || !meta || !meta.lastSeen || !meta.cell || !meta.category) {
         await redis.srem(ACTIVE_DRIVERS_SET, driverId);
+        continue;
+      }
+
+      const lastSeen = Number(meta.lastSeen);
+      if (Date.now() - lastSeen > LAST_SEEN_TTL_MS) {
+        const geoKey = geoKeyForCell(meta.category, meta.cell);
+        const pipe = redis.pipeline();
+        pipe.zrem(geoKey, driverId);
+        pipe.del(driverMetaKey(driverId));
+        pipe.srem(ACTIVE_DRIVERS_SET, driverId);
+        await pipe.exec();
         removed++;
       }
     }
-
-    processed += driverIds.length;
   } while (cursor !== "0");
 
   if (removed > 0) {
-    console.log(`🧹 Cleanup removed ${removed} inactive drivers (scanned ${processed})`);
+    console.log(`🧹 Cleanup removed ${removed} inactive drivers`);
   }
 }
 
-// run every minute
-cron.schedule("* * * * *", cleanupInactiveDrivers);
+// ---------------- Scheduler ----------------
+cron.schedule("*/30 * * * * *", cleanupInactiveDrivers);
 
-// ---------------- Demo Run ----------------
+// ---------------- Demo ----------------
 if (require.main === module) {
   (async () => {
-    await updateLocation("driver:demo1", 19.0760, 72.8777);
-    await updateLocation("driver:demo2", 19.0896, 72.8656);
+    console.log("🔄 Simulating drivers every 5s...");
 
-    console.log("✅ Inserted demo drivers");
+    const demoDrivers = [
+      { driverId: "driver:bike:1", category: "bike", lat: 19.0760, lon: 72.8777 },
+      { driverId: "driver:car:1", category: "car", lat: 19.0770, lon: 72.8787 },
+      { driverId: "driver:suv:1", category: "suv", lat: 19.0780, lon: 72.8797 },
+      { driverId: "driver:truck:1", category: "truck", lat: 19.0790, lon: 72.8807 },
+      { driverId: "driver:van:1", category: "van", lat: 19.0800, lon: 72.8817 },
+    ] as const;
 
-    const nearby = await searchNearby(19.0760, 72.8777, 3000, 10);
-    console.log("🔍 Nearby drivers:", nearby);
+    setInterval(async () => {
+      for (const { driverId, category, lat, lon } of demoDrivers) {
+        await updateLocation(driverId, lat, lon, category);
+        console.log(`📍 Updated ${driverId} (${category})`);
+      }
+    }, 5000);
+
+    setInterval(async () => {
+      const results = await searchNearby(19.076, 72.8777, 3000);
+      console.log("🔍 Nearby drivers (one per category):");
+      results.forEach(({ driverId, category, distance }) =>
+        console.log(`- ${driverId} (${category}) → ${distance.toFixed(1)}m`)
+      );
+      console.log("-----------");
+    }, 8000);
   })();
 }
