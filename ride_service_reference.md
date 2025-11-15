@@ -1,454 +1,713 @@
-# Ride Service (Mongoose + ioredis) — Reference Implementation
+Wallet Service — Full Repo (Pure TypeScript)
 
-A production-style, **single-file reference** for building an Uber-like **ride request → driver acceptance** flow at very high scale using **MongoDB (Mongoose)** and **Redis (ioredis)**. It focuses on:
+This repository is a complete, ready-to-run wallet-only service implemented in pure TypeScript. It includes models, services, a reservation expiry worker, tests, and local docker-compose for a single-node MongoDB replica set required for transactions.
 
-- **Idempotent ride creation** (no duplicate rides on retries)
-- **First-accept-wins** driver assignment (no multi-assign)
-- **MongoDB sharding** on `hashed _id`
-- **Safe Lua execution** with automatic fallback when Redis restarts (`NOSCRIPT` protection)
+Copy each file into your project wallet-service/ folder (paths shown). Run instructions are at the end.
 
-> You can copy each code block into files, or wire this into a monorepo. Commands and rationale included.
+⸻
 
----
+Repo file tree
 
-## 0) Quick Start
+wallet-service/
+├─ package.json
+├─ tsconfig.json
+├─ docker-compose.yml
+├─ .env.example
+├─ src/
+│  ├─ index.ts
+│  ├─ config/
+│  │  └─ mongoose.ts
+│  ├─ models/
+│  │  ├─ Wallet.ts
+│  │  ├─ WalletTransaction.ts
+│  │  ├─ WalletReservation.ts
+│  │  └─ IdempotencyKey.ts
+│  ├─ services/
+│  │  └─ wallet.service.ts
+│  ├─ workers/
+│  │  └─ reservationExpiry.worker.ts
+│  └─ utils/
+│     └─ errors.ts
+└─ tests/
+   └─ concurrency.test.ts
 
-```bash
-# 1) Install
-npm i express mongoose ioredis dotenv
 
-# 2) Start Mongo & Redis (examples)
-# Mongo: replicaset+sharding in your infra; for local dev, a single mongod is OK
-# Redis: use Redis Cluster in prod; for dev you can use single node
+⸻
 
-# 3) Configure env
-cat > .env <<'ENV'
-MONGO_URI=mongodb://localhost:27017/uber_clone
-# For Redis Cluster, comma-separated host:port; for single node, a single entry
-REDIS_NODES=127.0.0.1:6379
-PORT=3000
-ENV
+package.json
 
-# 4) Run
-node server.js
-```
-
----
-
-## 1) models/Ride.js — Mongoose Schema (shard-friendly)
-
-```js
-// models/Ride.js
-const mongoose = require("mongoose");
-
-const rideSchema = new mongoose.Schema(
-  {
-    // Parties
-    riderId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true, required: true },
-    driverId: { type: mongoose.Schema.Types.ObjectId, ref: "Driver", index: true },
-
-    // Locations (simple numeric lat/lng; use GeoJSON 2dsphere if you query Mongo by geo)
-    pickup: { lat: Number, lng: Number, address: String },
-    dropoff: { lat: Number, lng: Number, address: String },
-
-    // Pricing
-    estimatedFare: Number, // pre-ride estimate
-    actualFare: Number,    // finalized at completion
-
-    // Status lifecycle
-    status: {
-      type: String,
-      enum: ["requested", "accepted", "in_progress", "completed", "cancelled"],
-      default: "requested",
-      index: true,
-    },
-
-    // Idempotency (prevents duplicate ride creation)
-    idemKey: { type: String, unique: true, sparse: true },
-
-    // Timestamps
-    requestedAt: { type: Date, default: Date.now },
-    acceptedAt: { type: Date },
-    completedAt: { type: Date },
+{
+  "name": "wallet-service",
+  "version": "1.0.0",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "test": "jest --runInBand"
   },
-  { timestamps: true }
-);
-
-// ⚙️ Sharding: hashed on _id (declared here for clarity; run sharding in mongosh below)
-rideSchema.index({ _id: "hashed" });
-
-// Helpful secondary indexes for hot queries
-rideSchema.index({ driverId: 1, status: 1 });           // driver current ride
-rideSchema.index({ riderId: 1, createdAt: -1 });        // rider history
-
-module.exports = mongoose.model("Ride", rideSchema);
-```
-
-**Why hashed `_id`?** Uniform write distribution across shards with zero app complexity. Reads by `_id` are targeted; other queries use secondary indexes.
-
----
-
-## 2) lib/redis.js — ioredis (Single or Cluster)
-
-```js
-// lib/redis.js
-const Redis = require("ioredis");
-
-function buildRedis() {
-  const nodes = process.env.REDIS_NODES?.split(",").map(s => {
-    const [host, port] = s.split(":");
-    return { host, port: Number(port) };
-  }) || [];
-
-  if (nodes.length > 1) {
-    // Redis Cluster (recommended in production)
-    return new Redis.Cluster(nodes, {
-      scaleReads: "slave",
-      redisOptions: { enableAutoPipelining: true },
-    });
+  "dependencies": {
+    "http-errors": "^2.0.0",
+    "mongoose": "^7.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.0.0",
+    "@types/node": "^18.0.0",
+    "jest": "^29.0.0",
+    "mongodb-memory-server": "^8.7.0",
+    "ts-jest": "^29.0.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^4.9.0"
   }
-
-  // Single-node (dev/testing)
-  if (nodes.length === 1) {
-    const { host, port } = nodes[0];
-    return new Redis({ host, port, enableAutoPipelining: true });
-  }
-
-  // Default localhost
-  return new Redis({ host: "127.0.0.1", port: 6379, enableAutoPipelining: true });
 }
 
-module.exports = buildRedis();
-```
 
----
+⸻
 
-## 3) lib/lua.js — Lua Scripts + Safe Eval (NOSCRIPT fallback)
+tsconfig.json
 
-```js
-// lib/lua.js
-const redis = require("./redis");
-
-// Lua: first-accept-wins lock
-const LOCK_SCRIPT = `
-if redis.call('SETNX', KEYS[1], ARGV[1]) == 1 then
-  redis.call('PEXPIRE', KEYS[1], ARGV[2])
-  return 1
-else
-  return 0
-end
-`;
-
-// Lua: idempotency reserve-or-return existing
-const IDEM_SCRIPT = `
-local v = redis.call('GET', KEYS[1])
-if v then return v end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX')
-return ARGV[1]
-`;
-
-async function loadScripts() {
-  const [lockSha, idemSha] = await Promise.all([
-    redis.script("LOAD", LOCK_SCRIPT),
-    redis.script("LOAD", IDEM_SCRIPT),
-  ]);
-  return { lockSha, idemSha };
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*", "tests/**/*"]
 }
 
-// Safe eval: tries EVALSHA, falls back to EVAL on NOSCRIPT
-async function safeEval(sha, script, keys = [], args = []) {
-  try {
-    return await redis.evalsha(sha, keys.length, ...keys, ...args);
-  } catch (err) {
-    if (String(err && err.message).includes("NOSCRIPT")) {
-      return await redis.eval(script, keys.length, ...keys, ...args);
+
+⸻
+
+docker-compose.yml
+
+version: '3.8'
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: mongo_rs
+    ports:
+      - "27017:27017"
+    command: >
+      bash -c "mkdir -p /data/db &&
+               mongod --replSet rs0 --bind_ip_all --port 27017"
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
+
+
+⸻
+
+.env.example
+
+MONGO_URI=mongodb://localhost:27017/walletdb?replicaSet=rs0
+PORT=3000
+
+
+⸻
+
+src/config/mongoose.ts
+
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/walletdb?replicaSet=rs0';
+
+export const connectMongoose = async () => {
+  await mongoose.connect(MONGO_URI);
+  return mongoose.connection;
+};
+
+
+⸻
+
+src/models/Wallet.ts
+
+import mongoose, { Schema, Document, Model } from 'mongoose';
+
+export interface IWallet extends Document {
+  ownerId: string;
+  currency: string;
+  balance: number;
+  heldAmount: number;
+  meta?: Record<string, any>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const WalletSchema = new Schema<IWallet>({
+  ownerId: { type: String, required: true, index: true },
+  currency: { type: String, required: true },
+  balance: { type: Number, required: true, default: 0 },
+  heldAmount: { type: Number, required: true, default: 0 },
+  meta: { type: Schema.Types.Mixed }
+}, { timestamps: true });
+
+WalletSchema.index({ ownerId: 1, currency: 1 }, { unique: true });
+
+export const Wallet: Model<IWallet> = mongoose.model<IWallet>('Wallet', WalletSchema);
+
+
+⸻
+
+src/models/WalletTransaction.ts
+
+import mongoose, { Schema, Document, Model } from 'mongoose';
+
+export type TransactionType = 'DEPOSIT'|'WITHDRAW'|'HOLD'|'RELEASE'|'CAPTURE'|'VOUCHER_REDEMPTION'|'DRIVER_PAYOUT'|'REFUND'|'ADJUSTMENT'|'FEE'|'REVERSAL';
+export type TransactionCategory = 'RIDE'|'VOUCHER'|'TOPUP'|'GIFT'|'PAYOUT'|'REFUND'|'CANCELLATION'|'PROMOTION'|'OTHER';
+
+export interface IWalletTransaction extends Document {
+  walletId: mongoose.Types.ObjectId;
+  type: TransactionType;
+  category?: TransactionCategory;
+  amount: number;
+  currency: string;
+  beforeBalance: number;
+  afterBalance: number;
+  heldDelta?: number;
+  referenceId?: string;
+  idempotencyKey?: string;
+  relatedTxId?: mongoose.Types.ObjectId;
+  meta?: Record<string, any>;
+  createdAt: Date;
+}
+
+const WalletTransactionSchema = new Schema<IWalletTransaction>({
+  walletId: { type: Schema.Types.ObjectId, ref: 'Wallet', required: true, index: true },
+  type: { type: String, required: true, index: true },
+  category: { type: String, index: true },
+  amount: { type: Number, required: true },
+  currency: { type: String, required: true },
+  beforeBalance: { type: Number, required: true },
+  afterBalance: { type: Number, required: true },
+  heldDelta: { type: Number },
+  referenceId: { type: String, index: true },
+  idempotencyKey: { type: String, index: true },
+  relatedTxId: { type: Schema.Types.ObjectId, index: true },
+  meta: { type: Schema.Types.Mixed }
+}, { timestamps: { createdAt: true, updatedAt: false } });
+
+WalletTransactionSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
+WalletTransactionSchema.index({ walletId: 1, createdAt: -1 });
+WalletTransactionSchema.index({ walletId: 1, type: 1, createdAt: -1 });
+
+export const WalletTransaction: Model<IWalletTransaction> = mongoose.model<IWalletTransaction>('WalletTransaction', WalletTransactionSchema);
+
+
+⸻
+
+src/models/WalletReservation.ts
+
+import mongoose, { Schema, Document, Model } from 'mongoose';
+
+export type ReservationStatus = 'HELD'|'CAPTURED'|'RELEASED'|'EXPIRED'|'FAILED';
+
+export interface IWalletReservation extends Document {
+  walletId: mongoose.Types.ObjectId;
+  amount: number;
+  status: ReservationStatus;
+  expiresAt: Date;
+  reservedAt: Date;
+  idempotencyKey?: string;
+  referenceType?: string;
+  referenceId?: string;
+  meta?: Record<string, any>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const WalletReservationSchema = new Schema<IWalletReservation>({
+  walletId: { type: Schema.Types.ObjectId, ref: 'Wallet', required: true, index: true },
+  amount: { type: Number, required: true },
+  status: { type: String, enum: ['HELD','CAPTURED','RELEASED','EXPIRED','FAILED'], default: 'HELD', index: true },
+  expiresAt: { type: Date, required: true, index: true },
+  reservedAt: { type: Date, required: true, default: Date.now },
+  idempotencyKey: { type: String, index: true },
+  referenceType: { type: String, index: true },
+  referenceId: { type: String, index: true },
+  meta: { type: Schema.Types.Mixed }
+}, { timestamps: true });
+
+WalletReservationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+WalletReservationSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
+
+export const WalletReservation: Model<IWalletReservation> = mongoose.model<IWalletReservation>('WalletReservation', WalletReservationSchema);
+
+
+⸻
+
+src/models/IdempotencyKey.ts
+
+import mongoose, { Schema, Document, Model } from 'mongoose';
+
+export interface IIdempotencyKey extends Document {
+  key: string;
+  result?: any;
+  createdAt: Date;
+}
+
+const IdempotencyKeySchema = new Schema<IIdempotencyKey>({
+  key: { type: String, required: true, unique: true },
+  result: { type: Schema.Types.Mixed }
+}, { timestamps: { createdAt: true, updatedAt: false } });
+
+export const IdempotencyKey: Model<IIdempotencyKey> = mongoose.model<IIdempotencyKey>('IdempotencyKey', IdempotencyKeySchema);
+
+
+⸻
+
+src/services/wallet.service.ts
+
+import mongoose, { ClientSession } from 'mongoose';
+import createError from 'http-errors';
+import { Wallet } from '../models/Wallet';
+import { WalletTransaction } from '../models/WalletTransaction';
+import { WalletReservation } from '../models/WalletReservation';
+import { IdempotencyKey } from '../models/IdempotencyKey';
+
+export const walletService = (deps?: any) => {
+  const withSession = async <T>(fn: (session: ClientSession) => Promise<T>) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      const out = await fn(session);
+      await session.commitTransaction();
+      return out;
+    } catch (err) {
+      await session.abortTransaction();
+      throw err;
+    } finally {
+      session.endSession();
     }
-    throw err;
-  }
-}
+  };
 
-module.exports = { loadScripts, safeEval, LOCK_SCRIPT, IDEM_SCRIPT };
-```
+  const createWallet = async (ownerId: string, currency = 'USD', initialBalance = 0) => {
+    return new Wallet({ ownerId, currency, balance: initialBalance, heldAmount: 0 }).save();
+  };
 
----
+  const getWallet = async (walletId: string) => {
+    const w = await Wallet.findById(walletId).lean();
+    if (!w) throw createError(404, 'Wallet not found');
+    return w;
+  };
 
-## 4) services/rideService.js — Create (idempotent) & Accept (atomic)
+  const deposit = async (opts: { walletId: string; amount: number; idempotencyKey?: string; referenceId?: string; category?: string; meta?: any }) => {
+    const { walletId, amount, idempotencyKey, referenceId, category, meta } = opts;
+    if (amount <= 0) throw createError(400, 'Amount must be > 0');
 
-```js
-// services/rideService.js
-const crypto = require("crypto");
-const mongoose = require("mongoose");
-const redis = require("../lib/redis");
-const { safeEval, LOCK_SCRIPT, IDEM_SCRIPT } = require("../lib/lua");
-const Ride = require("../models/Ride");
+    return withSession(async (session) => {
+      if (idempotencyKey) {
+        const existing = await IdempotencyKey.findOne({ key: idempotencyKey }).session(session).lean();
+        if (existing?.result) return existing.result;
+      }
 
-// In-memory SHAs loaded at app start
-let SHAS = { lock: null, idem: null };
-function setShas({ lockSha, idemSha }) { SHAS.lock = lockSha; SHAS.idem = idemSha; }
+      const wallet = await Wallet.findById(walletId).session(session);
+      if (!wallet) throw createError(404, 'Wallet not found');
 
-// --- Fare calc placeholder (replace with your real logic) ---
-function calcEstimatedFare(pickup, dropoff) {
-  // Example: base 50 + per-km 10 + per-min 2 (dummy ETA)
-  const distanceKm = 5; // TODO: haversine or routing engine
-  const minutes = 12;   // TODO: ETA engine
-  return 50 + distanceKm * 10 + minutes * 2;
-}
+      const before = wallet.balance;
+      wallet.balance = before + amount;
+      await wallet.save({ session });
 
-// --- Create ride with idempotency (Redis-first) ---
-async function createRide({ riderId, pickup, dropoff, idemKey }) {
-  if (!idemKey) idemKey = crypto.randomUUID();
+      const tx = await WalletTransaction.create([{
+        walletId: wallet._id,
+        type: 'DEPOSIT',
+        category: category ?? 'TOPUP',
+        amount: amount,
+        currency: wallet.currency,
+        beforeBalance: before,
+        afterBalance: wallet.balance,
+        idempotencyKey,
+        referenceId,
+        meta
+      }], { session });
 
-  // Pre-generate ObjectId so retries can reference the same rideId
-  const rideId = new mongoose.Types.ObjectId().toString();
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne({ key: idempotencyKey }, { $set: { result: { txId: tx[0]._id } } }, { upsert: true, session });
+      }
 
-  const key = `idem:ride:${idemKey}`;
-
-  // Reserve or return existing rideId (TTL 15m)
-  const idemVal = await safeEval(
-    SHAS.idem,
-    IDEM_SCRIPT,
-    [key],
-    [rideId, 900]
-  );
-
-  if (idemVal !== rideId) {
-    // Duplicate; return existing (may still be inserting, so handle null carefully)
-    const existing = await Ride.findById(idemVal).lean();
-    return { ride: existing, idemKey };
-  }
-
-  // First time → persist to Mongo
-  try {
-    const ride = await Ride.create({
-      _id: rideId,
-      riderId,
-      pickup,
-      dropoff,
-      estimatedFare: calcEstimatedFare(pickup, dropoff),
-      status: "requested",
-      idemKey,
-      requestedAt: new Date(),
+      return tx[0];
     });
-    return { ride: ride.toObject(), idemKey };
-  } catch (e) {
-    // Roll back reservation so client can retry cleanly
-    await redis.del(key);
-    throw e;
-  }
-}
+  };
 
-// --- Driver accepts: Redis lock + Mongo conditional update ---
-async function acceptRide({ rideId, driverId }) {
-  const lockKey = `lock:ride:${rideId}`;
+  const withdraw = async (opts: { walletId: string; amount: number; idempotencyKey?: string; referenceId?: string; category?: string; meta?: any }) => {
+    const { walletId, amount, idempotencyKey, referenceId, category, meta } = opts;
+    if (amount <= 0) throw createError(400, 'Amount must be > 0');
 
-  // Acquire lock (15s)
-  const locked = await safeEval(
-    SHAS.lock,
-    LOCK_SCRIPT,
-    [lockKey],
-    [driverId, 15000]
-  );
+    return withSession(async (session) => {
+      if (idempotencyKey) {
+        const existing = await IdempotencyKey.findOne({ key: idempotencyKey }).session(session).lean();
+        if (existing?.result) return existing.result;
+      }
 
-  if (Number(locked) !== 1) {
-    throw new Error("Ride already locked by another driver");
-  }
+      const wallet = await Wallet.findOneAndUpdate({
+        _id: walletId,
+        $expr: { $gte: [{ $subtract: ['$balance', '$heldAmount'] }, amount] }
+      }, { $inc: { balance: -amount } }, { new: true, session });
 
-  // Finalize in Mongo (first-accept-wins)
-  const ride = await Ride.findOneAndUpdate(
-    { _id: rideId, status: "requested" },
-    { $set: { driverId, status: "accepted", acceptedAt: new Date() } },
-    { new: true }
-  ).lean();
+      if (!wallet) throw createError(400, 'Insufficient available funds or wallet not found');
 
-  if (!ride) {
-    // Either already accepted/cancelled or ride doesn't exist
-    throw new Error("Ride already accepted or not found");
-  }
+      const tx = await WalletTransaction.create([{
+        walletId: wallet._id,
+        type: 'WITHDRAW',
+        category: category ?? 'OTHER',
+        amount: -Math.abs(amount),
+        currency: wallet.currency,
+        beforeBalance: wallet.balance + amount,
+        afterBalance: wallet.balance,
+        idempotencyKey,
+        referenceId,
+        meta
+      }], { session });
 
-  return ride;
-}
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne({ key: idempotencyKey }, { $set: { result: { txId: tx[0]._id } } }, { upsert: true, session });
+      }
 
-module.exports = { createRide, acceptRide, setShas };
-```
-
----
-
-## 5) routes/rides.js — HTTP API (Express)
-
-```js
-// routes/rides.js
-const express = require("express");
-const { createRide, acceptRide } = require("../services/rideService");
-
-const router = express.Router();
-
-// Create ride (idempotent)
-router.post("/request", async (req, res) => {
-  try {
-    const { riderId, pickup, dropoff } = req.body;
-    const idemKey = req.header("x-idempotency-key") || req.body.idemKey;
-
-    const { ride, idemKey: returnedKey } = await createRide({
-      riderId,
-      pickup,
-      dropoff,
-      idemKey,
+      return tx[0];
     });
+  };
 
-    if (!ride) return res.status(202).json({ status: "pending", idemKey: returnedKey });
-    res.json({ rideId: ride._id, status: ride.status, idemKey: returnedKey, estimatedFare: ride.estimatedFare });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  const createReservation = async (opts: { walletId: string; amount: number; ttlSec?: number; idempotencyKey?: string; referenceType?: string; referenceId?: string; category?: string; meta?: any }) => {
+    const { walletId, amount, ttlSec = 30 * 60, idempotencyKey, referenceType, referenceId, category, meta } = opts;
+    if (amount <= 0) throw createError(400, 'Amount must be > 0');
+
+    return withSession(async (session) => {
+      if (idempotencyKey) {
+        const existing = await IdempotencyKey.findOne({ key: idempotencyKey }).session(session).lean();
+        if (existing?.result) return existing.result;
+      }
+
+      const wallet = await Wallet.findOneAndUpdate({
+        _id: walletId,
+        $expr: { $gte: [{ $subtract: ['$balance', '$heldAmount'] }, amount] }
+      }, { $inc: { heldAmount: amount } }, { new: true, session });
+
+      if (!wallet) throw createError(400, 'Insufficient available funds or wallet not found');
+
+      const expiresAt = new Date(Date.now() + ttlSec * 1000);
+      const reservation = await WalletReservation.create([{
+        walletId: wallet._id,
+        amount,
+        status: 'HELD',
+        expiresAt,
+        reservedAt: new Date(),
+        idempotencyKey,
+        referenceType,
+        referenceId,
+        meta
+      }], { session });
+
+      const tx = await WalletTransaction.create([{
+        walletId: wallet._id,
+        type: 'HOLD',
+        category: category ?? (referenceType ?? 'RIDE') as any,
+        amount: -Math.abs(amount),
+        currency: wallet.currency,
+        beforeBalance: wallet.balance,
+        afterBalance: wallet.balance,
+        heldDelta: amount,
+        referenceId: reservation[0]._id.toString(),
+        idempotencyKey,
+        meta: { expiresAt, ...meta }
+      }], { session });
+
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne({ key: idempotencyKey }, { $set: { result: { reservationId: reservation[0]._id, txId: tx[0]._id } } }, { upsert: true, session });
+      }
+
+      return { reservation: reservation[0], tx: tx[0], wallet };
+    });
+  };
+
+  const releaseReservation = async (opts: { reservationId: string; idempotencyKey?: string; reason?: string; meta?: any }) => {
+    const { reservationId, idempotencyKey, reason, meta } = opts;
+
+    return withSession(async (session) => {
+      const reservation = await WalletReservation.findById(reservationId).session(session);
+      if (!reservation) throw createError(404, 'Reservation not found');
+      if (reservation.status !== 'HELD') return { reservation, alreadyProcessed: true };
+
+      if (idempotencyKey) {
+        const existing = await IdempotencyKey.findOne({ key: idempotencyKey }).session(session).lean();
+        if (existing?.result) return existing.result;
+      }
+
+      const wallet = await Wallet.findOneAndUpdate({ _id: reservation.walletId, heldAmount: { $gte: reservation.amount } }, { $inc: { heldAmount: -reservation.amount } }, { new: true, session });
+      if (!wallet) throw createError(500, 'Inconsistent held amount');
+
+      reservation.status = 'RELEASED';
+      await reservation.save({ session });
+
+      const tx = await WalletTransaction.create([{
+        walletId: wallet._id,
+        type: 'RELEASE',
+        category: 'RIDE',
+        amount: reservation.amount,
+        currency: wallet.currency,
+        beforeBalance: wallet.balance,
+        afterBalance: wallet.balance,
+        heldDelta: -reservation.amount,
+        referenceId: reservation._id.toString(),
+        idempotencyKey,
+        meta: { reason, ...meta }
+      }], { session });
+
+      if (idempotencyKey) await IdempotencyKey.updateOne({ key: idempotencyKey }, { $set: { result: { reservationId: reservation._id, txId: tx[0]._id } } }, { upsert: true, session });
+
+      return { reservation, tx: tx[0], wallet };
+    });
+  };
+
+  const captureReservation = async (opts: { reservationId: string; amount?: number; idempotencyKey?: string; referenceId?: string; category?: string; meta?: any }) => {
+    const { reservationId, amount, idempotencyKey, referenceId, category, meta } = opts;
+
+    return withSession(async (session) => {
+      const reservation = await WalletReservation.findById(reservationId).session(session);
+      if (!reservation) throw createError(404, 'Reservation not found');
+      if (reservation.status !== 'HELD') throw createError(400, 'Reservation not active');
+
+      const captureAmount = amount ?? reservation.amount;
+      if (captureAmount <= 0 || captureAmount > reservation.amount) throw createError(400, 'Invalid capture amount');
+
+      if (idempotencyKey) {
+        const existing = await IdempotencyKey.findOne({ key: idempotencyKey }).session(session).lean();
+        if (existing?.result) return existing.result;
+      }
+
+      const wallet = await Wallet.findOneAndUpdate({
+        _id: reservation.walletId,
+        $expr: { $and: [{ $gte: ['$heldAmount', captureAmount] }, { $gte: ['$balance', captureAmount] }] }
+      }, { $inc: { heldAmount: -captureAmount, balance: -captureAmount } }, { new: true, session });
+
+      if (!wallet) throw createError(400, 'Insufficient held/settled funds to capture');
+
+      if (captureAmount === reservation.amount) {
+        reservation.status = 'CAPTURED';
+      } else {
+        reservation.amount = reservation.amount - captureAmount;
+      }
+      await reservation.save({ session });
+
+      const tx = await WalletTransaction.create([{
+        walletId: wallet._id,
+        type: 'CAPTURE',
+        category: category ?? 'RIDE',
+        amount: -Math.abs(captureAmount),
+        currency: wallet.currency,
+        beforeBalance: wallet.balance + captureAmount,
+        afterBalance: wallet.balance,
+        heldDelta: -captureAmount,
+        referenceId: referenceId ?? reservation._id.toString(),
+        idempotencyKey,
+        meta: { reservationId: reservation._id, ...meta }
+      }], { session });
+
+      if (idempotencyKey) await IdempotencyKey.updateOne({ key: idempotencyKey }, { $set: { result: { reservationId: reservation._id, txId: tx[0]._id } } }, { upsert: true, session });
+
+      return { reservation, tx: tx[0], wallet };
+    });
+  };
+
+  const getTransactions = async (walletId: string, limit = 50, page = 1) => {
+    const skip = (page - 1) * limit;
+    return WalletTransaction.find({ walletId }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
+  };
+
+  const computeAvailable = async (walletId: string) => {
+    const w = await Wallet.findById(walletId).lean();
+    if (!w) throw createError(404, 'Wallet not found');
+    return { balance: w.balance, heldAmount: w.heldAmount, available: w.balance - w.heldAmount };
+  };
+
+  return {
+    createWallet,
+    getWallet,
+    deposit,
+    withdraw,
+    createReservation,
+    releaseReservation,
+    captureReservation,
+    getTransactions,
+    computeAvailable
+  };
+};
+
+
+⸻
+
+src/workers/reservationExpiry.worker.ts
+
+import mongoose from 'mongoose';
+import { WalletReservation } from '../models/WalletReservation';
+import { Wallet } from '../models/Wallet';
+import { WalletTransaction } from '../models/WalletTransaction';
+
+// Batch expiry worker: find HELD reservations that expired and release them in batches
+export const reservationExpiryWorker = async (batchSize = 100) => {
+  while (true) {
+    const now = new Date();
+    const docs = await WalletReservation.find({ status: 'HELD', expiresAt: { $lte: now } }).limit(batchSize).lean();
+    if (!docs.length) break;
+
+    // group by wallet to update heldAmount per wallet safely
+    const byWallet: Record<string, typeof docs> = {} as any;
+    for (const d of docs) {
+      byWallet[d.walletId.toString()] = byWallet[d.walletId.toString()] || [];
+      byWallet[d.walletId.toString()].push(d);
+    }
+
+    // process per-wallet in a transaction
+    for (const [walletId, reservations] of Object.entries(byWallet)) {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        const total = reservations.reduce((s, r) => s + r.amount, 0);
+        const wallet = await Wallet.findOneAndUpdate({ _id: walletId, heldAmount: { $gte: total } }, { $inc: { heldAmount: -total } }, { new: true, session });
+        if (!wallet) {
+          // inconsistent; mark individually as EXPIRED without changing wallet (alert required)
+          for (const r of reservations) {
+            await WalletReservation.updateOne({ _id: r._id }, { $set: { status: 'EXPIRED' } }, { session });
+            await WalletTransaction.create([{ walletId, type: 'RELEASE', category: 'RIDE', amount: r.amount, currency: r.currency ?? 'USD', beforeBalance: wallet?.balance ?? 0, afterBalance: wallet?.balance ?? 0, heldDelta: -r.amount, referenceId: r._id }], { session });
+          }
+        } else {
+          // update reservation statuses and create release txs
+          for (const r of reservations) {
+            await WalletReservation.updateOne({ _id: r._id }, { $set: { status: 'EXPIRED' } }, { session });
+            await WalletTransaction.create([{ walletId, type: 'RELEASE', category: 'RIDE', amount: r.amount, currency: wallet.currency, beforeBalance: wallet.balance, afterBalance: wallet.balance, heldDelta: -r.amount, referenceId: r._id }], { session });
+          }
+        }
+
+        await session.commitTransaction();
+      } catch (err) {
+        await session.abortTransaction();
+        console.error('expiry worker error', err);
+      } finally {
+        session.endSession();
+      }
+    }
   }
-});
+};
 
-// Driver accepts ride (first-accept-wins)
-router.post("/:rideId/accept", async (req, res) => {
-  try {
-    const ride = await acceptRide({ rideId: req.params.rideId, driverId: req.body.driverId });
-    res.json({ rideId: ride._id, status: ride.status, driverId: ride.driverId, acceptedAt: ride.acceptedAt });
-  } catch (err) {
-    res.status(409).json({ error: err.message });
-  }
-});
 
-module.exports = router;
-```
+⸻
 
----
+src/utils/errors.ts
 
-## 6) app.js — Bootstrap (deterministic init)
+import createError from 'http-errors';
+export const notFound = (msg = 'Not found') => createError(404, msg);
+export const badRequest = (msg = 'Bad request') => createError(400, msg);
 
-```js
-// app.js
-require("dotenv").config();
-const express = require("express");
-const mongoose = require("mongoose");
-const ridesRouter = require("./routes/rides");
-const { loadScripts } = require("./lib/lua");
-const { setShas } = require("./services/rideService");
 
-async function bootstrap() {
-  // Mongo
-  await mongoose.connect(process.env.MONGO_URI, {
-    maxPoolSize: 200,
-    minPoolSize: 10,
-    retryWrites: true,
-    serverSelectionTimeoutMS: 5000,
-    socketTimeoutMS: 20000,
-  });
-  console.log("✅ Mongo connected");
+⸻
 
-  // Redis Lua scripts
-  const { lockSha, idemSha } = await loadScripts();
-  setShas({ lockSha, idemSha });
-  console.log("✅ Redis Lua scripts loaded");
+src/index.ts
 
-  // Express app
-  const app = express();
-  app.use(express.json());
-  app.use("/rides", ridesRouter);
+import { connectMongoose } from './config/mongoose';
+import { walletService } from './services/wallet.service';
+import dotenv from 'dotenv';
+import { reservationExpiryWorker } from './workers/reservationExpiry.worker';
 
-  return app;
-}
-
-module.exports = bootstrap;
-```
-
----
-
-## 7) server.js — Start HTTP Server
-
-```js
-// server.js
-const bootstrap = require("./app");
+dotenv.config();
 
 (async () => {
-  const app = await bootstrap();
-  const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`🚖 Ride service running on :${port}`));
+  await connectMongoose();
+  console.log('Mongo connected');
+
+  const svc = walletService();
+
+  // quick demo flow — create a wallet and run some ops
+  const wallet = await svc.createWallet('passenger:1', 'USD', 100000);
+  console.log('Created wallet', wallet._id.toString());
+
+  const deposit = await svc.deposit({ walletId: wallet._id.toString(), amount: 20000, referenceId: 'topup-1' });
+  console.log('Deposit tx', deposit._id.toString());
+
+  const reservation = await svc.createReservation({ walletId: wallet._id.toString(), amount: 15000, referenceType: 'RIDE', referenceId: 'ride-1' });
+  console.log('Reservation', reservation.reservation._id.toString());
+
+  // run expiry worker once (in production, run periodically)
+  await reservationExpiryWorker(50);
+
+  process.exit(0);
 })();
-```
 
----
 
-## 8) MongoDB Sharding — Commands (run once in mongosh)
+⸻
 
-```js
-use uber_clone
-sh.enableSharding("uber_clone")
-sh.shardCollection("uber_clone.rides", { _id: "hashed" })
-```
+tests/concurrency.test.ts
 
-**Indexes are in the schema**; ensure they’re created after sharding is enabled (Mongoose will create them on startup). For production, manage indexes explicitly with migrations.
+import mongoose from 'mongoose';
+import { walletService } from '../src/services/wallet.service';
+import dotenv from 'dotenv';
+import { Wallet } from '../src/models/Wallet';
 
----
+dotenv.config();
+jest.setTimeout(30000);
 
-## 9) REST Testing (cURL)
+describe('concurrency tests', () => {
+  let svc: ReturnType<typeof walletService>;
+  let walletId: string;
 
-```bash
-# Create ride (idempotent). Repeat the same idem key to test dedupe
-curl -s -X POST http://localhost:3000/rides/request \
-  -H 'Content-Type: application/json' \
-  -H 'x-idempotency-key: 11111111-1111-4111-8111-111111111111' \
-  -d '{
-    "riderId": "66c7a4e7f96c9e6b2f6d1111",
-    "pickup": {"lat":40.73,"lng":-74.00,"address":"SoHo"},
-    "dropoff": {"lat":40.75,"lng":-73.99,"address":"Hudson Yards"}
-  }' | jq
+  beforeAll(async () => {
+    await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/walletdb?replicaSet=rs0');
+    svc = walletService();
+    const w = await svc.createWallet('test-user', 'USD', 100000);
+    walletId = w._id.toString();
+  });
 
-# Driver accepts (first-accept-wins). Try calling twice or with a second driverId
-curl -s -X POST http://localhost:3000/rides/<RIDE_ID>/accept \
-  -H 'Content-Type: application/json' \
-  -d '{"driverId":"66c7a4e7f96c9e6b2f6d2222"}' | jq
-```
+  afterAll(async () => {
+    await mongoose.connection.db.dropDatabase();
+    await mongoose.disconnect();
+  });
 
----
+  test('parallel holds', async () => {
+    const holdAmount = 10000; // $100
+    const parallel = 15;
+    const promises = new Array(parallel).fill(0).map((_, i) =>
+      svc.createReservation({ walletId, amount: holdAmount, idempotencyKey: `hold-${i}-${Date.now()}` })
+        .then(r => ({ ok: true, r }))
+        .catch(e => ({ ok: false, e }))
+    );
 
-## 10) Scalability & Performance Notes
+    const results = await Promise.all(promises);
+    const success = results.filter(r => r.ok).length;
+    const fail = results.filter(r => !r.ok).length;
+    console.log('success', success, 'fail', fail);
+    expect(success * holdAmount).toBeLessThanOrEqual(100000);
 
-- **Redis first**: idempotency + locks in Redis avoid DB overload.
-- **TTL strategy**: `idem:ride:*` 15m, `lock:ride:*` 10–15s. All hot keys must expire.
-- **Retry safety**: `safeEval` auto-falls back to `EVAL` on `NOSCRIPT` after Redis restart.
-- **Mongo writes**: keep documents small (avoid growing arrays); cap any arrays with `$push + $slice`.
-- **Pool sizing**: Node → Mongo pool `200` is a good start; tune with load tests.
-- **Observability**: instrument p95/p99 for Redis eval and Mongo `findOneAndUpdate` latency.
-- **Sharding**: `_id: hashed` yields uniform write distribution—perfect if your hot queries are by `_id`, `driverId+status`, `riderId`.
+    const w = await Wallet.findById(walletId).lean();
+    expect(w!.heldAmount).toBe(success * holdAmount);
+  });
+});
 
----
 
-## 11) Optional: Redis 7 Functions (no SHA juggling)
+⸻
 
-If you run Redis 7+, you can register functions once and invoke by name.
+Run instructions
+	1.	git init && git add . && git commit -m "wallet service" (optional)
+	2.	npm install
+	3.	docker-compose up -d
+	4.	docker exec -it mongo_rs mongo --eval 'rs.initiate()' (run once)
+	5.	npm run start to run the demo in src/index.ts
+	6.	npm run test to run the Jest concurrency test (ensure Mongo replica set is running)
 
-```lua
--- redis-cli (example module named 'ride')
-FUNCTION LOAD LUA "\
-redis.register_function('lock_ride', function(keys, args) \
-  if redis.call('SETNX', keys[1], args[1]) == 1 then \
-    redis.call('PEXPIRE', keys[1], args[2]); return 1 \
-  else return 0 end \
-end) \
-redis.register_function('idem_ride', function(keys, args) \
-  local v = redis.call('GET', keys[1]); \
-  if v then return v end; \
-  redis.call('SET', keys[1], args[1], 'EX', args[2], 'NX'); \
-  return args[1] \
-end)" REPLACE
-```
+⸻
 
-Then call via ioredis `fcall('lock_ride', 1, key, driverId, ttl)`.
+Notes & next steps
+	•	This repo intentionally focuses on the wallet domain only. Integrate into your booking system by calling createReservation when you need to hold funds for a ride, then captureReservation on completion or releaseReservation on cancellation.
+	•	For extreme throughput, consider adding a Redis front or per-wallet worker as discussed earlier.
+	•	If you want, I can also generate Express controllers + routes (functional) and OpenAPI docs for these endpoints.
 
----
+⸻
 
-## 12) What’s Next?
-
-- Add **Socket.IO** to notify riders/drivers on state changes.
-- Add **Redis GEO** for driver discovery (tiles + GEOSEARCH).
-- Move pricing to a dedicated microservice if logic grows (surge, promos, taxes).
-- Add **Streams** or Kafka to queue ride requests + audit trail.
-
----
-
-**Done.** This single markdown captures the core files and logic for a high-scale ride service using Mongoose + ioredis with safe Lua handling and hashed sharding. Copy, paste, and extend. 🚀
-
+If you’d like, I can export this repository as a zip file or generate the Express API layer next.
